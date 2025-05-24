@@ -3,155 +3,202 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const db = require('./db'); // SQLite connection
+const pool = require('./db'); // Our PostgreSQL database connection pool
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; // Use port 3000 or Render's assigned port
 
-// ===== MIDDLEWARE =====
+// Middleware
 app.use(cors({
-    origin: 'http://127.0.0.1:5500', // Change this to your actual frontend origin
-    credentials: true
+    // IMPORTANT: For Render, this will likely be your own deployed frontend URL.
+    // Render often sets RENDER_EXTERNAL_HOSTNAME, which is the URL of your service.
+    // If frontend is separate, use its exact URL (e.g., 'https://your-frontend-app.onrender.com')
+    origin: process.env.NODE_ENV === 'production' ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}` : 'http://127.0.0.1:5500' // Adjust for your local Live Server port
+    // During local development, replace 'http://127.0.0.1:5500' with your actual Live Server URL (e.g., 'http://localhost:8080')
 }));
-app.use(express.json());
+app.use(express.json()); // For parsing application/json bodies
 
-// ===== JWT Secret =====
-const JWT_SECRET = 'your_super_secret_jwt_key'; // Use env var in production
+// Secret key for JWTs (MUST be set as an environment variable in production!)
+const JWT_SECRET = process.env.JWT_SECRET || 'a_very_insecure_default_secret_for_dev_ONLY'; // CHANGE THIS DEFAULT IN PRODUCTION!
 
-// ===== AUTH MIDDLEWARE =====
+// --- Authentication Middleware ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
 
-    if (!token) return res.sendStatus(401);
+    if (token == null) {
+        return res.sendStatus(401); // No token, Unauthorized
+    }
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) {
-            console.error('JWT Error:', err);
-            return res.sendStatus(403);
+            console.error('JWT verification error:', err);
+            return res.sendStatus(403); // Token invalid/expired, Forbidden
         }
-        req.user = user;
+        req.user = user; // Attach user payload to request
         next();
     });
 };
 
-// ===== ROUTES =====
+// --- API Routes ---
 
-// Register
-app.post('/api/register', (req, res) => {
+// 1. User Registration
+app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password)
-        return res.status(400).json({ message: 'Username and password required.' });
+
+    if (!username || !password) {
+        return res.status(400).json({ message: 'Username and password are required.' });
+    }
 
     const hashedPassword = bcrypt.hashSync(password, 10);
 
-    db.run("INSERT INTO users (username, password) VALUES (?, ?)",
-        [username, hashedPassword],
-        function (err) {
-            if (err) {
-                if (err.message.includes('UNIQUE constraint failed')) {
-                    return res.status(409).json({ message: 'Username already exists.' });
-                }
-                console.error(err.message);
-                return res.status(500).json({ message: 'Registration error.' });
-            }
-            res.status(201).json({ message: 'User registered!', userId: this.lastID });
-        });
+    try {
+        const result = await pool.query(
+            "INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id",
+            [username, hashedPassword]
+        );
+        res.status(201).json({ message: 'User registered successfully!', userId: result.rows[0].id });
+    } catch (err) {
+        if (err.code === '23505') { // PostgreSQL unique violation error code
+            return res.status(409).json({ message: 'Username already exists.' });
+        }
+        console.error('Error registering user:', err.message);
+        return res.status(500).json({ message: 'Error registering user.' });
+    }
 });
 
-// Login
-app.post('/api/login', (req, res) => {
+// 2. User Login
+app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password)
-        return res.status(400).json({ message: 'Username and password required.' });
 
-    db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
-        if (err) return res.status(500).json({ message: 'Login error.' });
-        if (!user || !bcrypt.compareSync(password, user.password)) {
+    if (!username || !password) {
+        return res.status(400).json({ message: 'Username and password are required.' });
+    }
+
+    try {
+        const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+        const user = result.rows[0]; // PostgreSQL returns an array of rows
+
+        if (!user) {
             return res.status(400).json({ message: 'Invalid username or password.' });
         }
 
-        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '1h' });
-        res.json({ message: 'Login successful', token, userId: user.id, username: user.username });
-    });
+        const isPasswordValid = bcrypt.compareSync(password, user.password);
+        if (!isPasswordValid) {
+            return res.status(400).json({ message: 'Invalid username or password.' });
+        }
+
+        // Generate JWT
+        const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '1h' }); // Token expires in 1 hour
+        res.json({ message: 'Login successful!', token, userId: user.id, username: user.username });
+    } catch (err) {
+        console.error('Error during login query:', err.message);
+        return res.status(500).json({ message: 'Server error during login.' });
+    }
 });
 
-// Get all businesses (public)
-app.get('/api/businesses', (req, res) => {
-    db.all("SELECT * FROM businesses", [], (err, rows) => {
-        if (err) return res.status(500).json({ message: 'Error fetching businesses.' });
-        res.json(rows);
-    });
+// 3. Get All Businesses (Publicly accessible)
+app.get('/api/businesses', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM businesses");
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching businesses:', err.message);
+        return res.status(500).json({ message: 'Error fetching businesses.' });
+    }
 });
 
-// Get business by ID (public)
-app.get('/api/businesses/:id', (req, res) => {
-    db.get("SELECT * FROM businesses WHERE id = ?", [req.params.id], (err, row) => {
-        if (err) return res.status(500).json({ message: 'Error fetching business.' });
-        if (!row) return res.status(404).json({ message: 'Business not found.' });
+// 4. Get Single Business by ID (Publicly accessible)
+app.get('/api/businesses/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query("SELECT * FROM businesses WHERE id = $1", [id]);
+        const row = result.rows[0];
+
+        if (!row) {
+            return res.status(404).json({ message: 'Business not found.' });
+        }
         res.json(row);
-    });
+    } catch (err) {
+        console.error('Error fetching business:', err.message);
+        return res.status(500).json({ message: 'Error fetching business.' });
+    }
 });
 
-// Add new business (auth required)
-app.post('/api/businesses', authenticateToken, (req, res) => {
+// 5. Add a New Business (Requires authentication)
+app.post('/api/businesses', authenticateToken, async (req, res) => {
     const { name, category, location, description, phone, email, website, hours, image, latitude, longitude } = req.body;
-    const userId = req.user.id;
+    const userId = req.user.id; // Get userId from the authenticated token
 
     if (!name || !category || !location || !description) {
-        return res.status(400).json({ message: 'Missing required fields.' });
+        return res.status(400).json({ message: 'Required business fields are missing.' });
     }
 
-    db.run(
-        `INSERT INTO businesses (userId, name, category, location, description, phone, email, website, hours, image, latitude, longitude)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [userId, name, category, location, description, phone, email, website, hours, image, latitude, longitude],
-        function (err) {
-            if (err) return res.status(500).json({ message: 'Error adding business.' });
-            res.status(201).json({ message: 'Business added!', businessId: this.lastID });
-        }
-    );
+    try {
+        const result = await pool.query(
+            `INSERT INTO businesses (user_id, name, category, location, description, phone, email, website, hours, image, latitude, longitude)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+            [userId, name, category, location, description, phone, email, website, hours, image, latitude, longitude]
+        );
+        res.status(201).json({ message: 'Business added successfully!', businessId: result.rows[0].id });
+    } catch (err) {
+        console.error('Error adding business:', err.message);
+        return res.status(500).json({ message: 'Error adding business.' });
+    }
 });
 
-// Get reviews for a business (public)
-app.get('/api/reviews/:businessId', (req, res) => {
-    db.all("SELECT * FROM reviews WHERE businessId = ?", [req.params.businessId], (err, rows) => {
-        if (err) return res.status(500).json({ message: 'Error fetching reviews.' });
-        res.json(rows);
-    });
+// 6. Get Reviews for a Business (Publicly accessible)
+app.get('/api/reviews/:businessId', async (req, res) => {
+    const { businessId } = req.params;
+    try {
+        const result = await pool.query("SELECT * FROM reviews WHERE business_id = $1", [businessId]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching reviews:', err.message);
+        return res.status(500).json({ message: 'Error fetching reviews.' });
+    }
 });
 
-// Add review (auth required)
-app.post('/api/reviews', authenticateToken, (req, res) => {
+// 7. Add a New Review (Requires authentication)
+app.post('/api/reviews', authenticateToken, async (req, res) => {
     const { businessId, reviewerName, text, rating } = req.body;
-    const userId = req.user.id;
-    const date = new Date().toLocaleDateString('en-US');
+    const userId = req.user.id; // Get userId from the authenticated token
+    const date = new Date().toLocaleDateString('en-US'); // Specify locale for consistent date string
 
-    if (!businessId || !reviewerName || !text || !rating)
+    if (!businessId || !reviewerName || !text || !rating) {
         return res.status(400).json({ message: 'All review fields are required.' });
+    }
 
-    db.run(
-        `INSERT INTO reviews (businessId, userId, reviewerName, text, rating, date)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [businessId, userId, reviewerName, text, rating, date],
-        function (err) {
-            if (err) return res.status(500).json({ message: 'Error adding review.' });
+    try {
+        const reviewResult = await pool.query(
+            `INSERT INTO reviews (business_id, user_id, reviewer_name, text, rating, review_date)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [businessId, userId, reviewerName, text, rating, date]
+        );
 
-            // Recalculate rating
-            db.all("SELECT rating FROM reviews WHERE businessId = ?", [businessId], (err, reviews) => {
-                if (!err && reviews.length > 0) {
-                    const avgRating = reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length;
-                    db.run("UPDATE businesses SET rating = ? WHERE id = ?", [avgRating, businessId]);
-                }
-            });
+        // After adding review, update the business's average rating
+        const allReviewsResult = await pool.query("SELECT rating FROM reviews WHERE business_id = $1", [businessId]);
+        const reviewRows = allReviewsResult.rows;
 
-            res.status(201).json({ message: 'Review added!', reviewId: this.lastID });
+        if (reviewRows.length > 0) {
+            const totalRating = reviewRows.reduce((sum, r) => sum + r.rating, 0);
+            const averageRating = totalRating / reviewRows.length;
+            await pool.query("UPDATE businesses SET rating = $1 WHERE id = $2", [averageRating, businessId]);
+            console.log(`Business ${businessId} rating updated to ${averageRating}`);
         }
-    );
+
+        res.status(201).json({ message: 'Review added successfully!', reviewId: reviewResult.rows[0].id });
+    } catch (err) {
+        console.error('Error adding review or updating business rating:', err.message);
+        return res.status(500).json({ message: 'Error adding review or updating business rating.' });
+    }
 });
 
-// ===== START SERVER =====
+
+// Start the server
 app.listen(PORT, () => {
-    console.log(`✅ Server running at http://localhost:${PORT}`);
-    console.log(`📡 API accessible at http://localhost:${PORT}/api/...`);
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Frontend should access API at http://localhost:${PORT}/api/...`);
+    console.log(`JWT_SECRET in use: ${JWT_SECRET}`); // For debugging
+    console.log(`DATABASE_URL in use: ${process.env.DATABASE_URL ? 'Set' : 'NOT SET!'}`); // For debugging
 });
