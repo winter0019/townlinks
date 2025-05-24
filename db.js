@@ -1,61 +1,39 @@
-// server/db.js
-const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcryptjs');
+// server/db.js (For PostgreSQL)
+const { Pool } = require('pg');
 
-const DB_PATH = './townlink.db'; // SQLite database file
+// Create a new Pool instance
+// Render will automatically provide the DATABASE_URL environment variable.
+// For local development, you'll need to set DATABASE_URL in a .env file
+// or directly here (though env vars are preferred).
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false // Required for Render production DB
+});
 
-let db = new sqlite3.Database(DB_PATH, (err) => {
-    if (err) {
-        console.error('Error connecting to database:', err.message);
-    } else {
-        console.log('Connected to the SQLite database.');
-        // Enable foreign key support (important for relationships)
-        db.run('PRAGMA foreign_keys = ON;', (pragmaErr) => {
-            if (pragmaErr) {
-                console.error('Error enabling foreign keys:', pragmaErr.message);
-            } else {
-                console.log('Foreign keys enabled.');
-            }
-        });
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client', err);
+  process.exit(-1);
+});
 
-        // Create Users table
-        db.run(`
+async function connectAndInitDb() {
+    try {
+        const client = await pool.connect();
+        console.log('Connected to PostgreSQL database.');
+
+        // Create tables if they don't exist
+        await client.query(`
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL
+                password TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        `, (err) => {
-            if (err) {
-                console.error("Error creating users table:", err.message);
-            } else {
-                console.log("Users table created or already exists.");
-                // Add a default admin user if not exists
-                db.get("SELECT COUNT(*) AS count FROM users WHERE username = 'admin'", (err, row) => {
-                    if (err) {
-                        console.error("Error checking for admin user:", err.message);
-                    } else if (row.count === 0) {
-                        const hashedPassword = bcrypt.hashSync('admin123', 10); // Hash default password
-                        db.run("INSERT INTO users (username, password) VALUES (?, ?)", ['admin', hashedPassword], (err) => {
-                            if (err) {
-                                console.error("Error inserting default admin user:", err.message);
-                            } else {
-                                console.log("Default admin user 'admin' created with password 'admin123'.");
-                            }
-                        });
-                    }
-                });
-            }
-        });
 
-        // Create Businesses table
-        db.run(`
             CREATE TABLE IF NOT EXISTS businesses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                userId INTEGER, -- NEW: Link to user who added it
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 category TEXT NOT NULL,
-                rating REAL DEFAULT 0.0,
                 location TEXT NOT NULL,
                 description TEXT,
                 phone TEXT,
@@ -65,37 +43,30 @@ let db = new sqlite3.Database(DB_PATH, (err) => {
                 image TEXT,
                 latitude REAL,
                 longitude REAL,
-                FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+                rating REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        `, (err) => {
-            if (err) {
-                console.error("Error creating businesses table:", err.message);
-            } else {
-                console.log("Businesses table created or already exists.");
-            }
-        });
 
-        // Create Reviews table
-        db.run(`
             CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                businessId INTEGER NOT NULL,
-                userId INTEGER, -- NEW: Link to user who wrote it (optional for now, can be null)
-                reviewerName TEXT NOT NULL,
+                id SERIAL PRIMARY KEY,
+                business_id INTEGER REFERENCES businesses(id) ON DELETE CASCADE,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                reviewer_name TEXT NOT NULL,
                 text TEXT NOT NULL,
-                rating INTEGER NOT NULL,
-                date TEXT NOT NULL,
-                FOREIGN KEY (businessId) REFERENCES businesses(id) ON DELETE CASCADE,
-                FOREIGN KEY (userId) REFERENCES users(id) ON DELETE SET NULL
+                rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+                review_date TEXT NOT NULL, -- Storing as text for simplicity with toLocaleDateString
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        `, (err) => {
-            if (err) {
-                console.error("Error creating reviews table:", err.message);
-            } else {
-                console.log("Reviews table created or already exists.");
-            }
-        });
+        `);
+        console.log('Tables created or already exist.');
+        client.release(); // Release the client back to the pool
+    } catch (err) {
+        console.error('Error connecting to or initializing PostgreSQL:', err.message);
+        // In a real application, you might want to retry or handle this gracefully
+        process.exit(1); // Exit if unable to connect or initialize DB
     }
-});
+}
 
-module.exports = db; // Export the database connection
+connectAndInitDb();
+
+module.exports = pool; // Export the pool for use in server.js
