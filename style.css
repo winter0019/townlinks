@@ -1,0 +1,18 @@
+/* style.css */
+
+/* Add any custom styles here that are not covered by Tailwind CSS utilities. */
+/* For example, specific animations or complex layouts. */
+
+/* Basic transition for mobile menu (concept, requires JS class toggling for full effect) */
+#nav-menu {
+    transition: all 0.3s ease-in-out;
+}
+
+/* Optional: Add some hover effect for the business cards */
+.block.bg-white.p-6.rounded-lg.shadow {
+    transition: transform 0.2s ease-in-out;
+}
+
+.block.bg-white.p-6.rounded-lg.shadow:hover {
+    transform: translateY(-3px); /* Slightly lift on hover */
+}
